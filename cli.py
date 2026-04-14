@@ -575,6 +575,14 @@ import fire
 from run_agent import AIAgent
 from model_tools import get_tool_definitions, get_toolset_for_tool
 
+# OTel observability shim — auto-activated when OTEL_ENABLED=true
+try:
+    from agent.otel_shim import OtelShim, merge_callbacks
+    _otel_shim_class = OtelShim
+except ImportError:
+    _otel_shim_class = None  # otel extra not installed
+    merge_callbacks = None
+
 # Extracted CLI modules (Phase 3)
 from hermes_cli.banner import build_welcome_banner
 from hermes_cli.commands import SlashCommandCompleter, SlashCommandAutoSuggest
@@ -1850,6 +1858,8 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+        # OTel observability shim — auto-initialised when OTEL_ENABLED=true
+        self._otel_shim: "OtelShim" = None
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -2858,6 +2868,17 @@ class HermesCLI:
                 pass
         
         try:
+            #OTel shim: init once, reuse for all subsequent agents ──────────
+            if _otel_shim_class is not None and self._otel_shim is None:
+                import os as _os
+                if _os.getenv("OTEL_ENABLED", "false").lower() in ("1", "true", "yes"):
+                    self._otel_shim = _otel_shim_class(
+                        agent=None,
+                        conversation_id=self.session_id,
+                        extra_attributes={"cli.session_id": self.session_id},
+                    )
+                    logger.info("OTel shim activated — traces and metrics will be exported")
+
             runtime = runtime_override or {
                 "api_key": self.api_key,
                 "base_url": self.base_url,
@@ -2868,6 +2889,13 @@ class HermesCLI:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            _otel_cbs = self._otel_shim.callbacks if self._otel_shim else {}
+            _inline_tui_cbs = {
+                "tool_start_callback":    self._on_tool_start if self._inline_diffs_enabled else None,
+                "tool_complete_callback": self._on_tool_complete if self._inline_diffs_enabled else None,
+            
+            }
+            _merged = merge_callbacks(_inline_tui_cbs, _otel_cbs)
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -7700,6 +7728,11 @@ class HermesCLI:
                         "error": _summary,
                     }
 
+            if self._otel_shim and self._otel_shim._otel_enabled:
+                self._otel_shim.start_trace(
+                   user_message=message if isinstance(message, str) else str(message)[:200]
+                )
+
             # Start agent in background thread (daemon so it cannot keep the
             # process alive when the user closes the terminal tab — SIGHUP
             # exits the main thread and daemon threads are reaped automatically).
@@ -7952,6 +7985,19 @@ class HermesCLI:
                 stop_event.set()
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
+            # ── OTel: close the trace span ──────────────────────────────────────
+            if self._otel_shim and self._otel_shim._trace_active:
+                response_text = (
+                    (result.get("final_response", "") if result else "")
+                    or ""
+                )
+                success = (
+                    result.get("completed", False) is True
+                    and not result.get("failed", False)
+                    and not result.get("partial", False)
+                    and response_text
+                )
+                self._otel_shim.end_trace(response_text, success=success)
     
     def _print_exit_summary(self):
         """Print session resume info on exit, similar to Claude Code."""

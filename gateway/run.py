@@ -243,6 +243,14 @@ from gateway.config import (
     GatewayConfig,
     load_gateway_config,
 )
+
+# OTel observability shim — auto-activated when OTEL_ENABLED=true
+try:
+    from agent.otel_shim import OtelShim, merge_callbacks as _merge_callbacks
+    _otel_shim_class = OtelShim
+except ImportError:
+    _otel_shim_class = None
+    _merge_callbacks = None
 from gateway.session import (
     SessionStore,
     SessionSource,
@@ -8104,9 +8112,66 @@ class GatewayRunner:
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
+            # OTel observability — wrap run_conversation with traces
+            _otel_shim = getattr(agent, '_otel_shim', None)
+            _otel_debug = []
+            if _otel_shim is None and _otel_shim_class is not None:
+                _otel_debug.append("shim_class available, creating instance")
+                from hermes_cli.profiles import get_active_profile_name
+                _otel_shim = _otel_shim_class(
+                    agent,
+                    conversation_id=session_id,
+                    extra_attributes={
+                        "user.id":    source.user_id or "",
+                        "platform":   source.platform.value if source.platform else "",
+                        "profile":    get_active_profile_name() or "default",
+                    },
+                )
+                agent._otel_shim = _otel_shim
+                _otel_debug.append(f"shim._otel_enabled={_otel_shim._otel_enabled}")
+                # Merge OTel callbacks with gateway's existing callbacks
+                if _merge_callbacks and hasattr(agent, 'tool_start_callback'):
+                    _existing = {
+                        k: getattr(agent, k, None)
+                        for k in ('tool_start_callback', 'tool_complete_callback',
+                                  'thinking_callback', 'step_callback', 'status_callback',
+                                  'clarify_callback', 'stream_delta_callback')
+                    }
+                    _merged = _merge_callbacks(_otel_shim.callbacks, _existing)
+                    for _k, _v in _merged.items():
+                        setattr(agent, _k, _v)
+                    _otel_debug.append(f"merged {len(_merged)} callbacks")
+                else:
+                    _otel_debug.append("merge_callbacks unavailable or agent lacks callbacks")
+            elif _otel_shim is not None:
+                _otel_debug.append("shim already attached")
+                # Refresh labels so this conversation gets the right user/platform/profile
+                from hermes_cli.profiles import get_active_profile_name
+                _otel_shim._extra.update({
+                    "user.id":    source.user_id or "",
+                    "platform":   source.platform.value if source.platform else "",
+                    "profile":    get_active_profile_name() or "default",
+                })
+                _otel_shim._conversation_id = session_id or _otel_shim._conversation_id
+            else:
+                _otel_debug.append("shim_class is None — OTel not available")
+            logger.info("OTEL_GATEWAY: %s", " | ".join(_otel_debug))
+
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                if _otel_shim:
+                    logger.info("OTEL_GATEWAY: calling start_trace message_len=%d", len(message))
+                    _otel_shim.start_trace(message)
+                try:
+                    result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                finally:
+                    if _otel_shim:
+                        _otel_shim.end_trace(result.get("final_response", ""), success=not result.get("error"))
+            except Exception as _otel_exc:
+                if _otel_shim:
+                    _otel_shim.record_error(str(_otel_exc), type(_otel_exc).__name__)
+                    _otel_shim.end_trace(str(_otel_exc), success=False)
+                raise
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

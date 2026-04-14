@@ -8321,6 +8321,24 @@ class AIAgent:
                     except Exception:
                         pass
 
+                    # OpenTelemetry: start LLM span before the API call
+                    _otel_shim = getattr(self, "_otel_shim", None)
+                    if _otel_shim is not None:
+                        try:
+                            cb = getattr(_otel_shim, "_on_pre_api_request", None)
+                            if cb:
+                                cb(
+                                    model=self.model,
+                                    provider=self.provider or "",
+                                    api_mode=self.api_mode,
+                                    message_count=len(api_messages),
+                                    tool_count=len(self.tools or []),
+                                    approx_input_tokens=approx_tokens,
+                                    api_call_number=api_call_count,
+                                )
+                        except Exception:
+                            pass
+
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -9718,6 +9736,22 @@ class AIAgent:
                     )
                 except Exception:
                     pass
+
+                # OpenTelemetry: close LLM span after the API call
+                _otel_shim = getattr(self, "_otel_shim", None)
+                if _otel_shim is not None:
+                    try:
+                        cb = getattr(_otel_shim, "_on_stream_complete", None)
+                        if cb:
+                            cb(
+                                output_tokens=getattr(self, "session_output_tokens", 0) or 0,
+                                finish_reason=finish_reason or "unknown",
+                                model=self.model,
+                                provider=self.provider or "",
+                                error=None,
+                            )
+                    except Exception:
+                        pass
 
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
