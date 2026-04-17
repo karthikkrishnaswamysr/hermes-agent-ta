@@ -164,6 +164,36 @@ sudo systemctl daemon-reload && sudo systemctl restart hermes-gateway
 - Confirm a **Prometheus** datasource exists and is healthy.
 - If either is missing, create it first (Tempo for traces, Prometheus for metrics), then import dashboards.
 
+**7. Optional: ship Hermes logs to Loki with Promtail**
+
+Promtail config templates are included under `otel/promtail/`.
+
+Scrape targets:
+- `~/.hermes/logs/gateway.log` (`app=hermes-agent`, `component=gateway`)
+- `~/.hermes/logs/agent.log` (`app=hermes-agent`, `component=agent`)
+- `~/.hermes/logs/errors.log` (`app=hermes-agent`, `component=errors`)
+- `~/.hermes/sessions/*.jsonl` (`app=hermes-agent`, `component=sessions`)
+
+Loki push endpoint:
+- `http://localhost:3100/loki/api/v1/push`
+
+> Ensure Loki is running and reachable at `http://localhost:3100` before enabling Promtail.
+
+Example install flow (Linux/systemd):
+```bash
+sudo install -m 0755 /path/to/promtail /usr/local/bin/promtail
+mkdir -p ~/.hermes/promtail
+cp otel/promtail/promtail-config.yaml ~/.hermes/promtail/promtail-config.yaml
+touch ~/.hermes/promtail/promtail-positions.yaml
+
+# edit otel/promtail/promtail-hermes.service and replace YOUR_USER
+sudo cp otel/promtail/promtail-hermes.service /etc/systemd/system/promtail-hermes.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now promtail-hermes
+```
+
+> `promtail-positions.yaml` is runtime state and should not be committed.
+
 **Available metrics:**
 
 | Metric | Type | Description |

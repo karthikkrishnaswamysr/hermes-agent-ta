@@ -51,6 +51,114 @@ get_command_link_display_dir() {
     fi
 }
 
+is_linux_systemd() {
+    [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1
+}
+
+install_promtail_for_hermes() {
+    local promtail_version="3.2.1"
+    local arch
+    arch="$(uname -m)"
+    local promtail_arch=""
+    case "$arch" in
+        x86_64|amd64) promtail_arch="amd64" ;;
+        aarch64|arm64) promtail_arch="arm64" ;;
+        *)
+            echo -e "${YELLOW}⚠${NC} Unsupported CPU architecture for Promtail auto-install: $arch"
+            echo "    Install manually and use otel/promtail/promtail-config.yaml"
+            return 1
+            ;;
+    esac
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    local zip_name="promtail-linux-${promtail_arch}.zip"
+    local download_url="https://github.com/grafana/loki/releases/download/v${promtail_version}/${zip_name}"
+    local promtail_bin="/usr/local/bin/promtail"
+    local promtail_home="${HERMES_HOME:-$HOME/.hermes}/promtail"
+    local config_dest="${promtail_home}/promtail-config.yaml"
+    local positions_dest="${promtail_home}/promtail-positions.yaml"
+    local service_dest="/etc/systemd/system/promtail-hermes.service"
+    local service_src="$SCRIPT_DIR/otel/promtail/promtail-hermes.service"
+    local config_src="$SCRIPT_DIR/otel/promtail/promtail-config.yaml"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠${NC} curl is required to install Promtail automatically."
+        return 1
+    fi
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠${NC} unzip is required to install Promtail automatically."
+        return 1
+    fi
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠${NC} sudo is required to install Promtail service files."
+        return 1
+    fi
+
+    echo -e "${CYAN}→${NC} Installing Promtail v${promtail_version} (${promtail_arch})..."
+    if ! curl -fL "$download_url" -o "$tmp_dir/$zip_name"; then
+        echo -e "${YELLOW}⚠${NC} Failed to download Promtail from ${download_url}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! unzip -o "$tmp_dir/$zip_name" -d "$tmp_dir" >/dev/null; then
+        echo -e "${YELLOW}⚠${NC} Failed to unzip Promtail archive."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! sudo install -m 0755 "$tmp_dir/promtail-linux-${promtail_arch}" "$promtail_bin"; then
+        echo -e "${YELLOW}⚠${NC} Failed to install Promtail binary to ${promtail_bin}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    rm -rf "$tmp_dir"
+
+    if [ ! -f "$config_src" ]; then
+        echo -e "${YELLOW}⚠${NC} Missing Promtail config template: $config_src"
+        return 1
+    fi
+    if [ ! -f "$service_src" ]; then
+        echo -e "${YELLOW}⚠${NC} Missing Promtail service template: $service_src"
+        return 1
+    fi
+
+    mkdir -p "$promtail_home"
+    cp "$config_src" "$config_dest"
+    touch "$positions_dest"
+
+    local escaped_home
+    escaped_home="$(printf '%s\n' "$HOME" | sed 's/[\/&]/\\&/g')"
+    sed "s|\${HOME}|${escaped_home}|g" "$config_dest" > "${config_dest}.tmp" && mv "${config_dest}.tmp" "$config_dest"
+
+    local tmp_service
+    tmp_service="$(mktemp)"
+    sed \
+        -e "s|YOUR_USER|$USER|g" \
+        -e "s|/home/$USER|$HOME|g" \
+        "$service_src" > "$tmp_service"
+
+    if ! sudo cp "$tmp_service" "$service_dest"; then
+        echo -e "${YELLOW}⚠${NC} Failed to install systemd service at ${service_dest}"
+        rm -f "$tmp_service"
+        return 1
+    fi
+    rm -f "$tmp_service"
+
+    if ! sudo systemctl daemon-reload; then
+        echo -e "${YELLOW}⚠${NC} Failed to reload systemd daemon after Promtail service install."
+        return 1
+    fi
+    if ! sudo systemctl enable --now promtail-hermes; then
+        echo -e "${YELLOW}⚠${NC} Failed to enable/start promtail-hermes service."
+        return 1
+    fi
+
+    echo -e "${GREEN}✓${NC} Promtail installed and running (service: promtail-hermes)"
+    echo "    Config: $config_dest"
+    echo "    Positions: $positions_dest"
+    return 0
+}
+
 echo ""
 echo -e "${CYAN}⚕ Hermes Agent Setup${NC}"
 echo ""
@@ -263,6 +371,28 @@ else
             echo "    https://github.com/BurntSushi/ripgrep#installation"
         fi
     fi
+fi
+
+# ============================================================================
+# Optional: Promtail (ship Hermes logs to Loki)
+# ============================================================================
+
+if is_termux; then
+    echo -e "${CYAN}→${NC} Skipping Promtail install prompt on Termux"
+elif is_linux_systemd; then
+    echo -e "${CYAN}→${NC} Optional: Promtail can ship Hermes logs to Loki"
+    echo -e "${YELLOW}⚠${NC} Ensure Loki is running and reachable at http://localhost:3100 before enabling Promtail."
+    read -p "Install and enable Promtail for Hermes logs? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if ! install_promtail_for_hermes; then
+            echo -e "${YELLOW}⚠${NC} Promtail auto-setup did not complete. You can configure manually with:"
+            echo "    otel/promtail/promtail-config.yaml"
+            echo "    otel/promtail/promtail-hermes.service"
+        fi
+    fi
+else
+    echo -e "${CYAN}→${NC} Promtail auto-setup is available on Linux/systemd hosts only"
 fi
 
 # ============================================================================

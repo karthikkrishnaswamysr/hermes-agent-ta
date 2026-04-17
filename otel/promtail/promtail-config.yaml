@@ -1,0 +1,42 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: ${HOME}/.hermes/promtail/promtail-positions.yaml
+
+clients:
+  - url: http://localhost:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: hermes_gateway_logs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          app: hermes-agent
+          component: gateway
+          __path__: ${HOME}/.hermes/logs/gateway.log
+
+  - job_name: hermes_agent_logs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          app: hermes-agent
+          component: agent
+          __path__: ${HOME}/.hermes/logs/agent.log
+
+  - job_name: hermes_error_logs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          app: hermes-agent
+          component: errors
+          __path__: ${HOME}/.hermes/logs/errors.log
+
+  - job_name: hermes_session_jsonl
+    static_configs:
+      - targets: [localhost]
+        labels:
+          app: hermes-agent
+          component: sessions
+          __path__: ${HOME}/.hermes/sessions/*.jsonl

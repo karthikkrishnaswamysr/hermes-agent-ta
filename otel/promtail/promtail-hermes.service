@@ -1,0 +1,15 @@
+[Unit]
+Description=Promtail for Hermes Agent
+After=network.target
+
+[Service]
+Type=simple
+# Update YOUR_USER before enabling this unit.
+User=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+ExecStart=/usr/local/bin/promtail --config.file=/home/YOUR_USER/.hermes/promtail/promtail-config.yaml --config.expand-env=true
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
