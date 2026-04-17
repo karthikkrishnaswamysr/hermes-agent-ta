@@ -1210,6 +1210,94 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"Heartbeat should include last_activity_desc: {touch_calls}")
 
 
+class TestDelegateOtelSubagentTelemetry(unittest.TestCase):
+    """Tests for subagent telemetry hooks emitted via parent _otel_shim."""
+
+    def test_subagent_span_started_and_closed_on_success(self):
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        parent._otel_shim = MagicMock()
+        parent._otel_shim._otel_enabled = True
+        parent._otel_shim.start_subagent_span.return_value = "subagent-1"
+
+        child = MagicMock()
+        child.model = "test-model"
+        child.enabled_toolsets = ["terminal", "file"]
+        child.get_activity_summary.return_value = {
+            "current_tool": "terminal",
+            "api_call_count": 1,
+            "max_iterations": 50,
+            "last_activity_desc": "tool started",
+        }
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [],
+        }
+
+        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
+            result = _run_single_child(
+                task_index=0,
+                goal="Collect diagnostics",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        parent._otel_shim.start_subagent_span.assert_called_once()
+        parent._otel_shim.end_subagent_span.assert_called_once_with(
+            "subagent-1",
+            outcome="completed",
+            api_calls=2,
+            error=None,
+        )
+
+    def test_subagent_stall_event_emitted_after_threshold(self):
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        parent._otel_shim = MagicMock()
+        parent._otel_shim._otel_enabled = True
+        parent._otel_shim.start_subagent_span.return_value = "subagent-stall"
+
+        child = MagicMock()
+        child.model = "test-model"
+        child.enabled_toolsets = ["terminal"]
+        child.get_activity_summary.return_value = {
+            "current_tool": "terminal",
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "last_activity_desc": "running terminal",
+        }
+
+        def slow_run(**_kwargs):
+            time.sleep(0.07)
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = slow_run
+
+        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01), patch(
+            "tools.delegate_tool._STALL_THRESHOLD_SECS", 0.02
+        ):
+            _run_single_child(
+                task_index=0,
+                goal="Long running command",
+                child=child,
+                parent_agent=parent,
+            )
+
+        parent._otel_shim.record_subagent_stalled.assert_called()
+
+
 class TestDelegationReasoningEffort(unittest.TestCase):
     """Tests for delegation.reasoning_effort config override."""
 

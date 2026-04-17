@@ -7986,7 +7986,11 @@ class HermesCLI:
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
             # ── OTel: close the trace span ──────────────────────────────────────
-            if self._otel_shim and self._otel_shim._trace_active:
+            if (
+                self._otel_shim
+                and self._otel_shim._trace_active
+                and self._otel_shim._otel_enabled
+            ):
                 response_text = (
                     (result.get("final_response", "") if result else "")
                     or ""

@@ -1394,6 +1394,18 @@ class GatewayRunner:
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
+                _otel_shim = getattr(agent, "_otel_shim", None)
+                if _otel_shim and getattr(_otel_shim, "_otel_enabled", False):
+                    _otel_shim.record_runtime_event(
+                        "gateway.shutdown.interrupt_sent",
+                        session_key=session_key,
+                        reason=reason,
+                    )
+                    # Force-close in-flight trace spans during shutdown so
+                    # long-running turns are visible in Tempo even when the
+                    # process exits before normal run_conversation unwind.
+                    if getattr(_otel_shim, "_trace_active", False):
+                        _otel_shim.end_trace("Gateway shutdown interrupt", success=False)
                 agent.interrupt(reason)
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key[:20])
             except Exception as e:
@@ -2029,6 +2041,18 @@ class GatewayRunner:
             timeout = self._restart_drain_timeout
             active_agents, timed_out = await self._drain_active_agents(timeout)
             if timed_out:
+                for _session_key, _agent in active_agents.items():
+                    try:
+                        _otel_shim = getattr(_agent, "_otel_shim", None)
+                        if _otel_shim and getattr(_otel_shim, "_otel_enabled", False):
+                            _otel_shim.record_runtime_event(
+                                "gateway.shutdown.drain_timeout",
+                                timeout_seconds=timeout,
+                                active_agents=self._running_agent_count(),
+                                session_key=_session_key,
+                            )
+                    except Exception:
+                        pass
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
                     timeout,
@@ -2041,6 +2065,20 @@ class GatewayRunner:
                 while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
+                if self._running_agents:
+                    for _session_key, _agent in list(self._running_agents.items()):
+                        if _agent is _AGENT_PENDING_SENTINEL:
+                            continue
+                        try:
+                            _otel_shim = getattr(_agent, "_otel_shim", None)
+                            if _otel_shim and getattr(_otel_shim, "_otel_enabled", False):
+                                _otel_shim.record_runtime_event(
+                                    "gateway.shutdown.interrupt_incomplete",
+                                    session_key=_session_key,
+                                    active_agents=self._running_agent_count(),
+                                )
+                        except Exception:
+                            pass
 
             if self._restart_requested and self._restart_detached:
                 try:
@@ -8114,6 +8152,7 @@ class GatewayRunner:
             _approval_session_token = set_current_session_key(_approval_session_key)
             # OTel observability — wrap run_conversation with traces
             _otel_shim = getattr(agent, '_otel_shim', None)
+            _otel_enabled = bool(_otel_shim and getattr(_otel_shim, "_otel_enabled", False))
             _otel_debug = []
             if _otel_shim is None and _otel_shim_class is not None:
                 _otel_debug.append("shim_class available, creating instance")
@@ -8129,6 +8168,7 @@ class GatewayRunner:
                 )
                 agent._otel_shim = _otel_shim
                 _otel_debug.append(f"shim._otel_enabled={_otel_shim._otel_enabled}")
+                _otel_enabled = bool(getattr(_otel_shim, "_otel_enabled", False))
                 # Merge OTel callbacks with gateway's existing callbacks
                 if _merge_callbacks and hasattr(agent, 'tool_start_callback'):
                     _existing = {
@@ -8153,22 +8193,26 @@ class GatewayRunner:
                     "profile":    get_active_profile_name() or "default",
                 })
                 _otel_shim._conversation_id = session_id or _otel_shim._conversation_id
+                _otel_enabled = bool(getattr(_otel_shim, "_otel_enabled", False))
             else:
                 _otel_debug.append("shim_class is None — OTel not available")
+            if _otel_shim and not _otel_enabled:
+                _otel_debug.append("shim disabled — OTEL_ENABLED=false or SDK unavailable")
             logger.info("OTEL_GATEWAY: %s", " | ".join(_otel_debug))
 
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                if _otel_shim:
+                if _otel_enabled:
                     logger.info("OTEL_GATEWAY: calling start_trace message_len=%d", len(message))
                     _otel_shim.start_trace(message)
                 try:
                     result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
                 finally:
-                    if _otel_shim:
-                        _otel_shim.end_trace(result.get("final_response", ""), success=not result.get("error"))
+                    if _otel_enabled and getattr(_otel_shim, "_trace_active", False):
+                        _result = result if isinstance(result, dict) else {}
+                        _otel_shim.end_trace(_result.get("final_response", ""), success=not _result.get("error"))
             except Exception as _otel_exc:
-                if _otel_shim:
+                if _otel_enabled and getattr(_otel_shim, "_trace_active", False):
                     _otel_shim.record_error(str(_otel_exc), type(_otel_exc).__name__)
                     _otel_shim.end_trace(str(_otel_exc), success=False)
                 raise
@@ -8388,8 +8432,11 @@ class GatewayRunner:
         _NOTIFY_INTERVAL_RAW = float(os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 600))
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _notify_start = time.time()
+        _notify_last_signature = None
+        _notify_repeat_count = 0
 
         async def _notify_long_running():
+            nonlocal _notify_last_signature, _notify_repeat_count
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
@@ -8401,6 +8448,7 @@ class GatewayRunner:
                 # Include agent activity context if available.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
+                _a = {}
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
@@ -8418,6 +8466,36 @@ class GatewayRunner:
                         f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
                         metadata=_status_thread_metadata,
                     )
+                    _otel_shim = getattr(_agent_ref, "_otel_shim", None) if _agent_ref else None
+                    if _otel_shim and getattr(_otel_shim, "_otel_enabled", False):
+                        _signature = (
+                            _a.get("api_call_count", 0),
+                            _a.get("current_tool") or "",
+                            _a.get("last_activity_desc") or "",
+                        )
+                        if _signature == _notify_last_signature:
+                            _notify_repeat_count += 1
+                        else:
+                            _notify_repeat_count = 0
+                            _notify_last_signature = _signature
+                        _otel_shim.record_runtime_event(
+                            "gateway.agent.still_working",
+                            elapsed_minutes=_elapsed_mins,
+                            api_call_count=_a.get("api_call_count", 0),
+                            max_iterations=_a.get("max_iterations", 0),
+                            current_tool=_a.get("current_tool") or "",
+                            seconds_since_activity=round(float(_a.get("seconds_since_activity", 0.0)), 3),
+                        )
+                        # Same state reported repeatedly strongly suggests a stuck tool/subagent.
+                        if _notify_repeat_count >= 2:
+                            _otel_shim.record_runtime_event(
+                                "gateway.agent.possible_stuck",
+                                repeat_notifications=_notify_repeat_count + 1,
+                                api_call_count=_a.get("api_call_count", 0),
+                                current_tool=_a.get("current_tool") or "",
+                                last_activity_desc=_a.get("last_activity_desc", "")[:240],
+                                seconds_since_activity=round(float(_a.get("seconds_since_activity", 0.0)), 3),
+                            )
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -8500,6 +8578,16 @@ class GatewayRunner:
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):
                         _warning_fired = True
+                        _otel_warn_shim = getattr(_agent_ref, "_otel_shim", None) if _agent_ref else None
+                        if _otel_warn_shim and getattr(_otel_warn_shim, "_otel_enabled", False):
+                            _otel_warn_shim.record_runtime_event(
+                                "gateway.agent.inactivity_warning",
+                                idle_seconds=round(float(_idle_secs), 3),
+                                warning_threshold_seconds=_agent_warning,
+                                timeout_seconds=_agent_timeout,
+                                api_call_count=_act.get("api_call_count", 0) if isinstance(_act, dict) else 0,
+                                current_tool=(_act.get("current_tool", "") if isinstance(_act, dict) else ""),
+                            )
                         _warn_adapter = self.adapters.get(source.platform)
                         if _warn_adapter:
                             _elapsed_warn = int(_agent_warning // 60) or 1
@@ -8559,6 +8647,17 @@ class GatewayRunner:
                     _last_desc, _iter_n, _iter_max,
                     _cur_tool or "none",
                 )
+                _timeout_shim = getattr(_timed_out_agent, "_otel_shim", None) if _timed_out_agent else None
+                if _timeout_shim and getattr(_timeout_shim, "_otel_enabled", False):
+                    _timeout_shim.record_runtime_event(
+                        "gateway.agent.inactivity_timeout",
+                        idle_seconds=round(float(_secs_ago), 3),
+                        timeout_seconds=_agent_timeout,
+                        current_tool=_cur_tool or "",
+                        last_activity_desc=str(_last_desc)[:240],
+                        api_call_count=_iter_n,
+                        max_iterations=_iter_max,
+                    )
 
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.

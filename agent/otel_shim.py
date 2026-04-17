@@ -44,18 +44,42 @@ import time
 import logging
 import re
 import json
+import threading
 from typing import Optional, Any
 from datetime import datetime, timezone
 #import fs
-from opentelemetry import trace, metrics
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.trace import Status, StatusCode
+try:
+    from opentelemetry import trace, metrics
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.trace import Status, StatusCode
+    _OTEL_IMPORT_OK = True
+except ImportError:
+    trace = None
+    metrics = None
+    TracerProvider = None
+    BatchSpanProcessor = None
+    MeterProvider = None
+    PeriodicExportingMetricReader = None
+    Resource = None
+    SERVICE_NAME = "service.name"
+    SERVICE_VERSION = "service.version"
+    OTLPSpanExporter = None
+    OTLPMetricExporter = None
+    _OTEL_IMPORT_OK = False
+
+    class StatusCode:
+        OK = "ok"
+        ERROR = "error"
+
+    class Status:
+        def __init__(self, *_args, **_kwargs):
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +126,18 @@ _query_counter             = None
 _tool_counter             = None
 _query_latency_hist       = None
 _tool_latency_hist        = None
+_tool_stalled_counter     = None
 _error_counter            = None
 _active_conversations_gauge = None
 _llm_latency_hist         = None
 _llm_error_counter        = None
 _state_gauge              = None
 _state_duration_hist      = None
+_subagent_duration_hist   = None
+_subagent_outcome_counter = None
+_subagent_stalled_counter = None
+_TOOL_HEARTBEAT_INTERVAL_SECS = int(os.getenv("OTEL_TOOL_HEARTBEAT_INTERVAL_SECS", "30"))
+_TOOL_STALL_THRESHOLD_SECS = int(os.getenv("OTEL_TOOL_STALL_THRESHOLD_SECS", "300"))
 
 
 def _parse_headers(header_str: str) -> dict:
@@ -166,10 +196,15 @@ def _init_otel() -> None:
     global _error_counter, _active_conversations_gauge
     global _llm_latency_hist, _llm_error_counter
     global _state_gauge, _state_duration_hist
+    global _subagent_duration_hist, _subagent_outcome_counter, _subagent_stalled_counter
+    global _tool_stalled_counter
 
     if _otel_initialised:
         return
     _otel_initialised = True
+    if not _OTEL_IMPORT_OK:
+        logger.warning("OTEL_INIT: OpenTelemetry packages not installed; instrumentation disabled")
+        return
 
     logger.info("OTEL_INIT: starting initialization — endpoint=%s", OTEL_EXPORTER_OTLP_ENDPOINT)
 
@@ -238,6 +273,11 @@ def _init_otel() -> None:
         description="Per-tool call latency in seconds",
         unit="s",
     )
+    _tool_stalled_counter = _meter.create_counter(
+        name="hermes.tool.stalled.total",
+        description="Total number of tool calls detected as stalled",
+        unit="1",
+    )
 
     # UpDownCounter for active conversations
     _active_conversations_gauge = _meter.create_up_down_counter(
@@ -271,6 +311,22 @@ def _init_otel() -> None:
         name="hermes.conversation.state_duration_seconds",
         description="Time spent in each conversation state",
         unit="s",
+    )
+
+    _subagent_duration_hist = _meter.create_histogram(
+        name="hermes.subagent.duration_seconds",
+        description="Subagent task duration in seconds",
+        unit="s",
+    )
+    _subagent_outcome_counter = _meter.create_counter(
+        name="hermes.subagent.outcome.total",
+        description="Total subagent outcomes by status",
+        unit="1",
+    )
+    _subagent_stalled_counter = _meter.create_counter(
+        name="hermes.subagent.stalled.total",
+        description="Total subagent stall detections",
+        unit="1",
     )
 
     logger.info(
@@ -321,15 +377,16 @@ def merge_callbacks(*callback_dicts) -> dict:
             result[name] = fns[0]
         else:
             # Wrap all of them in a single dispatcher
-            def make_dispatcher(fs):
+            def make_dispatcher(fs, cb_name: str):
                 def dispatcher(*args, **kwargs):
                     for f in fs:
                         try:
                             f(*args, **kwargs)
                         except Exception:
-                            logger.exception("callback %s.%s raised", name, f.__name__)
+                            fn_name = getattr(f, "__name__", None) or getattr(f, "_mock_name", None) or type(f).__name__
+                            logger.exception("callback %s.%s raised", cb_name, fn_name)
                 return dispatcher
-            result[name] = make_dispatcher(fns)
+            result[name] = make_dispatcher(fns, name)
 
     return result
 
@@ -363,8 +420,12 @@ class OtelShim:
         conversation_id: Optional[str] = None,
         extra_attributes: Optional[dict] = None,
     ):
-        if OTEL_ENABLED:
+        if OTEL_ENABLED and _OTEL_IMPORT_OK:
             _init_otel()
+        elif OTEL_ENABLED and not _OTEL_IMPORT_OK:
+            logger.warning(
+                "OTEL requested but opentelemetry packages are unavailable; set OTEL_ENABLED=false or install deps"
+            )
 
         self._agent            = agent
         self._conversation_id = conversation_id or f"conv-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
@@ -378,6 +439,12 @@ class OtelShim:
         self._llm_span        : Optional[Any]    = None
         self._llm_start       : Optional[float]  = None
         self._llm_call_count  : int              = 0
+        self._subagent_spans: dict[str, dict[str, Any]] = {}
+        self._subagent_lock = threading.Lock()
+        self._tool_heartbeat_stop: dict[str, threading.Event] = {}
+        self._tool_heartbeat_threads: dict[str, threading.Thread] = {}
+        self._tool_stalled: set[str] = set()
+        self._tool_lock = threading.Lock()
 
         # ── State machine ──────────────────────────────────────────────────────
         # States:  idle=0 | thinking=1 | tool_executing=2 | waiting_for_user=3
@@ -611,6 +678,135 @@ class OtelShim:
             self._span.record_exception(Exception(error_message))
             self._span.set_status(Status(StatusCode.ERROR, error_message))
 
+    def record_runtime_event(self, event_name: str, **attributes: Any) -> None:
+        """Attach a runtime event to the active root conversation span."""
+        if not self._otel_enabled or not self._span:
+            return
+        try:
+            self._span.add_event(event_name, attributes={**attributes, **self._base_labels()})
+        except Exception:
+            pass
+
+    def _root_context(self):
+        """Return context anchored to root conversation span when available."""
+        if not self._otel_enabled or trace is None or not self._span:
+            return None
+        try:
+            return trace.set_span_in_context(self._span)
+        except Exception:
+            return None
+
+    def start_subagent_span(
+        self,
+        *,
+        task_index: int,
+        goal: str,
+        toolsets: Optional[list[str]] = None,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
+        """Start a child span for delegated subagent execution."""
+        if not self._otel_enabled or _tracer is None:
+            return None
+        handle = f"subagent-{task_index}-{time.time_ns()}"
+        attrs = {
+            "subagent.task_index": task_index,
+            "subagent.goal.preview": (goal or "")[:200],
+            "subagent.goal.length": len(goal or ""),
+            "subagent.model": model or "",
+            "subagent.toolsets": ",".join(toolsets or []),
+            "conversation.id": self._conversation_id,
+            **self._base_labels(),
+        }
+        parent_ctx = trace.set_span_in_context(self._span) if self._span else None
+        span = _tracer.start_span(name="subagent.run", context=parent_ctx, attributes=attrs)
+        span.__enter__()
+        with self._subagent_lock:
+            self._subagent_spans[handle] = {"span": span, "start": time.perf_counter(), "stalled": False}
+        return handle
+
+    def record_subagent_event(self, handle: Optional[str], event_name: str, **attributes: Any) -> None:
+        """Attach a subagent lifecycle event to the child span."""
+        if not handle:
+            return
+        with self._subagent_lock:
+            entry = self._subagent_spans.get(handle)
+        if not entry:
+            return
+        span = entry.get("span")
+        if not span:
+            return
+        try:
+            span.add_event(event_name, attributes={**attributes, **self._base_labels()})
+        except Exception:
+            pass
+
+    def record_subagent_stalled(self, handle: Optional[str], *, elapsed_seconds: float, current_tool: str = "") -> None:
+        """Record a stall event exactly once per subagent run."""
+        if not handle:
+            return
+        should_emit = False
+        with self._subagent_lock:
+            entry = self._subagent_spans.get(handle)
+            if entry and not entry.get("stalled"):
+                entry["stalled"] = True
+                should_emit = True
+        if not should_emit:
+            return
+        if _subagent_stalled_counter is not None:
+            try:
+                _subagent_stalled_counter.add(1, self._base_labels({"subagent.current_tool": current_tool or ""}))
+            except Exception:
+                pass
+        self.record_subagent_event(
+            handle,
+            "subagent.stalled",
+            elapsed_seconds=round(elapsed_seconds, 3),
+            current_tool=current_tool or "",
+        )
+
+    def end_subagent_span(
+        self,
+        handle: Optional[str],
+        *,
+        outcome: str,
+        api_calls: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        """Close delegated subagent span and emit metrics."""
+        if not handle:
+            return
+        with self._subagent_lock:
+            entry = self._subagent_spans.pop(handle, None)
+        if not entry:
+            return
+        span = entry.get("span")
+        elapsed = max(0.0, time.perf_counter() - float(entry.get("start") or 0.0))
+
+        if _subagent_duration_hist is not None:
+            try:
+                _subagent_duration_hist.record(elapsed, self._base_labels({"subagent.outcome": outcome}))
+            except Exception:
+                pass
+        if _subagent_outcome_counter is not None:
+            try:
+                _subagent_outcome_counter.add(1, self._base_labels({"subagent.outcome": outcome}))
+            except Exception:
+                pass
+
+        if span:
+            try:
+                span.set_attribute("subagent.outcome", outcome)
+                span.set_attribute("subagent.api_calls", int(api_calls or 0))
+                span.set_attribute("subagent.duration_seconds", round(elapsed, 3))
+                if error:
+                    span.set_attribute("subagent.error", str(error)[:500])
+                    span.set_status(Status(StatusCode.ERROR, str(error)[:200]))
+                else:
+                    span.set_status(Status(StatusCode.OK))
+                span.__exit__(None, None, None)
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Internal callbacks — wired to AIAgent
     # ------------------------------------------------------------------
@@ -636,6 +832,7 @@ class OtelShim:
 
         span = _tracer.start_span(
             name=f"tool.{tool_name}",
+            context=self._root_context(),
             attributes={
                 "tool.call_id": tool_call_id,
                 "tool.name":    tool_name,
@@ -645,6 +842,63 @@ class OtelShim:
         )
         span.__enter__()
         self._tool_spans[tool_call_id] = span
+        self.record_runtime_event(
+            "tool.started",
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+        )
+
+        # Emit heartbeat/stall events while a tool call runs so long gaps are observable.
+        stop_event = threading.Event()
+        with self._tool_lock:
+            self._tool_heartbeat_stop[tool_call_id] = stop_event
+            self._tool_stalled.discard(tool_call_id)
+
+        def _heartbeat_loop() -> None:
+            while not stop_event.wait(_TOOL_HEARTBEAT_INTERVAL_SECS):
+                start_ts = self._tool_start.get(tool_call_id)
+                span_obj = self._tool_spans.get(tool_call_id)
+                if not start_ts:
+                    return
+                elapsed = max(0.0, time.perf_counter() - start_ts)
+                if span_obj:
+                    try:
+                        span_obj.add_event(
+                            "tool.heartbeat",
+                            attributes={
+                                "tool.call_id": tool_call_id,
+                                "tool.name": tool_name,
+                                "tool.elapsed_seconds": round(elapsed, 3),
+                                **self._base_labels(),
+                            },
+                        )
+                    except Exception:
+                        pass
+                if elapsed >= _TOOL_STALL_THRESHOLD_SECS and tool_call_id not in self._tool_stalled:
+                    self._tool_stalled.add(tool_call_id)
+                    if span_obj:
+                        try:
+                            span_obj.add_event(
+                                "tool.stalled",
+                                attributes={
+                                    "tool.call_id": tool_call_id,
+                                    "tool.name": tool_name,
+                                    "tool.elapsed_seconds": round(elapsed, 3),
+                                    **self._base_labels(),
+                                },
+                            )
+                        except Exception:
+                            pass
+                    if _tool_stalled_counter is not None:
+                        try:
+                            _tool_stalled_counter.add(1, self._base_labels({"tool.name": tool_name}))
+                        except Exception:
+                            pass
+
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        with self._tool_lock:
+            self._tool_heartbeat_threads[tool_call_id] = heartbeat_thread
+        heartbeat_thread.start()
 
     def _on_tool_complete(
         self,
@@ -656,6 +910,14 @@ class OtelShim:
         if not OTEL_ENABLED:
             return
 
+        with self._tool_lock:
+            stop_event = self._tool_heartbeat_stop.pop(tool_call_id, None)
+            heartbeat_thread = self._tool_heartbeat_threads.pop(tool_call_id, None)
+        if stop_event:
+            stop_event.set()
+        if heartbeat_thread and heartbeat_thread.is_alive():
+            heartbeat_thread.join(timeout=0.2)
+
         start = self._tool_start.pop(tool_call_id, None)
         span  = self._tool_spans.pop(tool_call_id, None)
         latency = time.perf_counter() - start if start else 0.0
@@ -666,11 +928,13 @@ class OtelShim:
             is_error = _is_error_result(function_result)
             span.set_attribute("tool.result_length", len(function_result) if function_result else 0)
             span.set_attribute("tool.error", is_error)
+            span.set_attribute("tool.stalled", tool_call_id in self._tool_stalled)
             span.set_status(Status(StatusCode.OK if not is_error else StatusCode.ERROR))
             span.__exit__(None, None, None)
 
             if is_error:
                 _error_counter.add(1, self._base_labels({"error.type": "tool", "tool.name": tool_name}))
+        self._tool_stalled.discard(tool_call_id)
 
         # State: back to thinking (1) — agent will call LLM again next
         self._set_state(1)
@@ -756,6 +1020,7 @@ class OtelShim:
         span_name = f"llm.{api_mode} {self._llm_call_count}/{model}"
         self._llm_span = _tracer.start_span(
             name=span_name,
+            context=self._root_context(),
             attributes={
                 "llm.model":       model,
                 "llm.provider":    provider or "unknown",

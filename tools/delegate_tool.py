@@ -51,6 +51,7 @@ _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+_STALL_THRESHOLD_SECS = 10 * 60  # emit stalled telemetry after 10 minutes
 
 
 def _get_max_concurrent_children() -> int:
@@ -408,6 +409,24 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    _otel_shim = getattr(parent_agent, "_otel_shim", None) if parent_agent is not None else None
+    _otel_enabled = bool(_otel_shim and getattr(_otel_shim, "_otel_enabled", False))
+    _subagent_span = None
+    if _otel_enabled and hasattr(_otel_shim, "start_subagent_span"):
+        try:
+            _subagent_span = _otel_shim.start_subagent_span(
+                task_index=task_index,
+                goal=goal,
+                model=getattr(child, "model", None),
+                toolsets=getattr(child, "enabled_toolsets", None),
+            )
+            _otel_shim.record_subagent_event(
+                _subagent_span,
+                "subagent.started",
+                task_index=task_index,
+            )
+        except Exception:
+            _subagent_span = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
@@ -445,6 +464,8 @@ def _run_single_child(
                 continue
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
+            child_tool = ""
+            child_iter = 0
             try:
                 child_summary = child.get_activity_summary()
                 child_tool = child_summary.get("current_tool")
@@ -464,6 +485,25 @@ def _run_single_child(
                 touch(desc)
             except Exception:
                 pass
+            if _otel_enabled and _subagent_span:
+                try:
+                    elapsed = time.monotonic() - child_start
+                    _otel_shim.record_subagent_event(
+                        _subagent_span,
+                        "subagent.heartbeat",
+                        elapsed_seconds=round(elapsed, 3),
+                        status_desc=desc[:240],
+                        current_tool=child_tool or "",
+                        iteration=child_iter,
+                    )
+                    if elapsed >= _STALL_THRESHOLD_SECS:
+                        _otel_shim.record_subagent_stalled(
+                            _subagent_span,
+                            elapsed_seconds=elapsed,
+                            current_tool=child_tool or "",
+                        )
+                except Exception:
+                    pass
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     _heartbeat_thread.start()
@@ -563,11 +603,32 @@ def _run_single_child(
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
+        if _otel_enabled and hasattr(_otel_shim, "end_subagent_span"):
+            try:
+                _otel_shim.end_subagent_span(
+                    _subagent_span,
+                    outcome=status,
+                    api_calls=api_calls,
+                    error=entry.get("error"),
+                )
+            except Exception:
+                pass
+
         return entry
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
+        if _otel_enabled and hasattr(_otel_shim, "end_subagent_span"):
+            try:
+                _otel_shim.end_subagent_span(
+                    _subagent_span,
+                    outcome="error",
+                    api_calls=0,
+                    error=str(exc),
+                )
+            except Exception:
+                pass
         return {
             "task_index": task_index,
             "status": "error",
